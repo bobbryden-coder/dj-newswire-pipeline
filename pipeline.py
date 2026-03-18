@@ -1,6 +1,7 @@
 """
 Dow Jones Newswire Pipeline
-Pulls NML files from sFTP, parses DJNML XML, upserts articles to Supabase.
+Pulls NML files from sFTP, parses DJNML XML, upserts articles to Supabase,
+and scores each article with Claude immediately on ingest.
 
 Feeds:
     EWP3 (primary):  ftpnews1.dowjones.com
@@ -11,17 +12,20 @@ Environment variables required:
     SFTP_PASSWORD       - Dow Jones sFTP password
     SUPABASE_URL        - Supabase project URL
     SUPABASE_KEY        - Supabase service role key
+    ANTHROPIC_API_KEY   - Anthropic API key (optional — skips scoring if missing)
 """
 
 import os
 import re
 import gzip
+import time
 import hashlib
 import logging
 from io import BytesIO
 from html import unescape
 from datetime import datetime, timezone
 
+import anthropic
 import paramiko
 from supabase import create_client, Client
 
@@ -42,12 +46,35 @@ SFTP_USER     = "ewplwc"
 SFTP_PASSWORD = os.environ["SFTP_PASSWORD"]
 SFTP_DIR      = "."
 
-SUPABASE_URL  = os.environ["SUPABASE_URL"]
-SUPABASE_KEY  = os.environ["SUPABASE_KEY"]
+SUPABASE_URL      = os.environ["SUPABASE_URL"]
+SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-PM_CODES = {"I/GLD", "N/GPC", "N/PCS", "N/SVR", "N/PLM", "I/PPM"}
+PM_CODES     = {"I/GLD", "N/GPC", "N/PCS", "N/SVR", "N/PLM", "I/PPM"}
+TABLE        = "dj_articles"
+RETRY_DELAY  = 1    # seconds between Claude API calls
+MAX_RETRIES  = 3
 
-TABLE = "dj_articles"
+SYSTEM_PROMPT = """You are a financial sentiment analyst specialising in precious metals markets including gold, silver, platinum and palladium.
+
+You will be given a news article headline and body. Score the sentiment of the article from the perspective of a precious metals trader on a scale of 0 to 100 where:
+
+0-20   = Very bearish (strong negative price pressure, major sell-off, severe negative news)
+21-40  = Bearish (negative tone, headwinds, mild selling pressure)
+41-59  = Neutral (balanced, factual, no clear directional bias)
+60-79  = Bullish (positive tone, tailwinds, mild buying pressure)
+80-100 = Very bullish (strong positive price pressure, major rally, severe positive news)
+
+Consider:
+- Price movements mentioned (rising = bullish, falling = bearish)
+- Demand signals (ETF inflows, central bank buying = bullish)
+- Supply signals (mine output increases = bearish)
+- Macro context (dollar weakness, inflation = bullish for gold)
+- Risk sentiment (risk-off = bullish for gold)
+- Company news (positive earnings, new discoveries = bullish)
+
+Respond with ONLY a single integer between 0 and 100. No explanation, no text, just the number."""
+
 
 # ── sFTP Connection ───────────────────────────────────────────────────────────
 def get_sftp_client():
@@ -151,10 +178,53 @@ def extract_articles(nml_content):
             "pub_date": pub_date,
             "source": source,
             "codes": list(codes & PM_CODES),
+            "sentiment": None,
             "ingested_at": datetime.now(timezone.utc).isoformat(),
         })
 
     return articles
+
+
+# ── Sentiment Scoring ─────────────────────────────────────────────────────────
+def score_article(client, headline, body):
+    content = f"Headline: {headline}\n\nBody: {body or ''}"
+    for attempt in range(MAX_RETRIES):
+        try:
+            message = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=10,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": content}]
+            )
+            score_text = message.content[0].text.strip()
+            score = int(score_text)
+            if 0 <= score <= 100:
+                return score
+            log.warning(f"Score out of range: {score}")
+            return None
+        except ValueError:
+            log.warning(f"Non-integer response: {score_text}")
+            return None
+        except Exception as e:
+            log.warning(f"API error (attempt {attempt + 1}): {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+    return None
+
+
+def score_and_update(supabase, client, articles):
+    scored = 0
+    for article in articles:
+        score = score_article(client, article["headline"], article.get("body"))
+        if score is not None:
+            try:
+                supabase.table(TABLE).update({"sentiment": score}).eq("id", article["id"]).execute()
+                scored += 1
+                log.info(f"  [{score:3d}] {article['headline'][:80]}")
+            except Exception as e:
+                log.error(f"Sentiment update failed for {article['id']}: {e}")
+        time.sleep(RETRY_DELAY)
+    return scored
 
 
 # ── Supabase Upsert ───────────────────────────────────────────────────────────
@@ -174,6 +244,11 @@ def run():
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     sftp, ssh = get_sftp_client()
 
+    # Initialise Claude client if API key present
+    claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+    if not claude:
+        log.warning("ANTHROPIC_API_KEY not set — articles will be upserted without sentiment scores")
+
     try:
         remote_files = list_remote_files(sftp, SFTP_DIR)
         processed    = get_processed_filenames(supabase)
@@ -182,6 +257,7 @@ def run():
         log.info(f"Remote files: {len(remote_files)} | Already processed: {len(processed)} | New: {len(new_files)}")
 
         total_articles = 0
+        total_scored   = 0
 
         for filename in new_files:
             remote_path = f"{SFTP_DIR}/{filename}"
@@ -198,14 +274,18 @@ def run():
                 n = upsert_articles(supabase, articles)
                 total_articles += n
 
+                if n > 0 and claude:
+                    scored = score_and_update(supabase, claude, articles)
+                    total_scored += scored
+
                 mark_file_processed(supabase, filename)
-                log.info(f"  → {n} precious metals articles upserted from {filename}")
+                log.info(f"  → {n} articles upserted, {total_scored} scored so far")
 
             except Exception as e:
                 log.error(f"Error processing {filename}: {e}")
                 continue
 
-        log.info(f"Done. Total articles upserted: {total_articles}")
+        log.info(f"Done. Articles upserted: {total_articles} | Scored: {total_scored}")
 
     finally:
         sftp.close()
