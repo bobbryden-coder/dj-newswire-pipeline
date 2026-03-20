@@ -52,7 +52,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 PM_CODES     = {"I/GLD", "N/GPC", "N/PCS", "N/SVR", "N/PLM", "I/PPM"}
 TABLE        = "dj_articles"
-RETRY_DELAY  = 1    # seconds between Claude API calls
+RETRY_DELAY  = 1
 MAX_RETRIES  = 3
 
 SYSTEM_PROMPT = """You are a financial sentiment analyst specialising in precious metals markets including gold, silver, platinum and palladium.
@@ -163,6 +163,9 @@ def extract_articles(nml_content):
         acc_match = re.search(r'accession-number="([^"]+)"', doc)
         article_id = acc_match.group(1) if acc_match else hashlib.md5(f"{headline}{pub_date}".encode()).hexdigest()
 
+        seq_match = re.search(r'\bseq="(\d+)"', doc)
+        sequence_number = int(seq_match.group(1)) if seq_match else None
+
         body_match = re.search(r'<text>(.*?)</text>', doc, re.DOTALL)
         if not body_match:
             body_match = re.search(r'<body>(.*?)</body>', doc, re.DOTALL)
@@ -173,6 +176,8 @@ def extract_articles(nml_content):
 
         articles.append({
             "id": article_id,
+            "accession_number": article_id,
+            "sequence_number": sequence_number,
             "headline": headline,
             "body": body,
             "pub_date": pub_date,
@@ -244,7 +249,6 @@ def run():
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     sftp, ssh = get_sftp_client()
 
-    # Initialise Claude client if API key present
     claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
     if not claude:
         log.warning("ANTHROPIC_API_KEY not set — articles will be upserted without sentiment scores")
