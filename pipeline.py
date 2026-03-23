@@ -50,7 +50,12 @@ SUPABASE_URL      = os.environ["SUPABASE_URL"]
 SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-PM_CODES     = {"I/GLD", "N/GPC", "N/PCS", "N/SVR", "N/PLM", "I/PPM"}
+PM_CODES = {
+    # Gold & precious metals core
+    "I/GLD", "N/GPC", "N/PCS", "N/SVR", "N/PLM", "I/PPM",
+    # Mining & metals broader coverage
+    "I/MNG", "I/ONF", "N/MET", "N/OSME", "N/NMX",
+}
 TABLE        = "dj_articles"
 RETRY_DELAY  = 1
 MAX_RETRIES  = 3
