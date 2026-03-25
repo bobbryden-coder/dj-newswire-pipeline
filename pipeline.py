@@ -23,7 +23,7 @@ import hashlib
 import logging
 from io import BytesIO
 from html import unescape
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import anthropic
 import paramiko
@@ -50,17 +50,33 @@ SUPABASE_URL      = os.environ["SUPABASE_URL"]
 SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
+# ── Commodity Code Sets ───────────────────────────────────────────────────────
 PM_CODES = {
     # Gold & precious metals core
     "I/GLD", "N/GPC", "N/PCS", "N/SVR", "N/PLM", "I/PPM",
     # Mining & metals broader coverage
     "I/MNG", "I/ONF", "N/MET", "N/OSME", "N/NMX",
 }
-TABLE        = "dj_articles"
-RETRY_DELAY  = 1
-MAX_RETRIES  = 3
 
-SYSTEM_PROMPT = """You are a financial sentiment analyst specialising in precious metals markets including gold, silver, platinum and palladium.
+OIL_CODES = {
+    "N/PET",    # Crude Oil & Petroleum Products
+    "N/CMKT",   # Crude Market Commentary
+    "N/EGY",    # Energy Commentary
+    "N/OPC",    # OPEC & OPEC+
+    "N/PRD",    # Oil & Natural Gas Production
+    "N/RMKT",   # Refined Products Spot Market Commentary
+    "I/OIL",    # Major Oil & Natural Gas Companies
+    "I/OIS",    # Upstream Oil & Gas
+    "N/NRG",    # Dow Jones Energy Service
+}
+
+ALL_CODES = PM_CODES | OIL_CODES
+
+RETRY_DELAY = 1
+MAX_RETRIES = 3
+
+# ── Sentiment Prompts ─────────────────────────────────────────────────────────
+GOLD_PROMPT = """You are a financial sentiment analyst specialising in precious metals markets including gold, silver, platinum and palladium.
 
 You will be given a news article headline and body. Score the sentiment of the article from the perspective of a precious metals trader on a scale of 0 to 100 where:
 
@@ -77,6 +93,27 @@ Consider:
 - Macro context (dollar weakness, inflation = bullish for gold)
 - Risk sentiment (risk-off = bullish for gold)
 - Company news (positive earnings, new discoveries = bullish)
+
+Respond with ONLY a single integer between 0 and 100. No explanation, no text, just the number."""
+
+OIL_PROMPT = """You are a financial sentiment analyst specialising in crude oil and energy markets.
+
+You will be given a news article headline and body. Score the sentiment of the article from the perspective of a crude oil trader on a scale of 0 to 100 where:
+
+0-20   = Very bearish (strong negative price pressure, major sell-off, severe negative news)
+21-40  = Bearish (negative tone, headwinds, oversupply, demand destruction)
+41-59  = Neutral (balanced, factual, no clear directional bias)
+60-79  = Bullish (positive tone, supply cuts, demand growth, geopolitical risk premium)
+80-100 = Very bullish (strong positive price pressure, major supply shock, severe positive news)
+
+Consider:
+- Price movements mentioned (rising = bullish, falling = bearish)
+- OPEC+ production decisions (cuts = bullish, increases = bearish)
+- Inventory data (draws = bullish, builds = bearish)
+- Demand signals (economic growth, travel demand = bullish)
+- Geopolitical risk (Middle East tensions, sanctions = bullish)
+- Supply disruptions (pipeline outages, hurricanes = bullish)
+- Refinery margins and product demand
 
 Respond with ONLY a single integer between 0 and 100. No explanation, no text, just the number."""
 
@@ -106,19 +143,20 @@ def list_remote_files(sftp, remote_dir):
         return []
 
 
-def get_processed_filenames(supabase):
+def get_processed_filenames(supabase, remote_files):
+    """Only check if the remote files we care about have been processed."""
     try:
-        all_files = set()
-        page = 0
-        while True:
-            result = supabase.table("dj_processed_files").select("filename").range(page * 1000, (page + 1) * 1000 - 1).execute()
-            if not result.data:
-                break
-            all_files.update(row["filename"] for row in result.data)
-            if len(result.data) < 1000:
-                break
-            page += 1
-        return all_files
+        if not remote_files:
+            return set()
+        processed = set()
+        # Check in batches of 500
+        batch_size = 500
+        for i in range(0, len(remote_files), batch_size):
+            batch = remote_files[i:i + batch_size]
+            result = supabase.table("dj_processed_files").select("filename").in_("filename", batch).execute()
+            if result.data:
+                processed.update(row["filename"] for row in result.data)
+        return processed
     except Exception as e:
         log.warning(f"Could not fetch processed files: {e}")
         return set()
@@ -146,17 +184,23 @@ def clean_text(raw):
 
 
 def extract_articles(nml_content):
-    articles = []
+    """Extract articles and classify as gold, oil, or both."""
+    gold_articles = []
+    oil_articles = []
+
     docs = re.findall(r'<doc\b[^>]*>.*?</doc>', nml_content, re.DOTALL)
 
     for doc in docs:
         codes = set(re.findall(r'<c>([^<]+)</c>', doc))
-        if not codes & PM_CODES:
+        
+        is_gold = bool(codes & PM_CODES)
+        is_oil = bool(codes & OIL_CODES)
+        
+        if not is_gold and not is_oil:
             continue
 
         hl_match = re.search(r'<headline[^>]*>(.*?)</headline>', doc, re.DOTALL)
         headline = clean_text(hl_match.group(1)) if hl_match else None
-
         if not headline:
             continue
 
@@ -179,7 +223,7 @@ def extract_articles(nml_content):
         source_match = re.search(r'<source[^>]*>([^<]+)</source>', doc)
         source = source_match.group(1).strip() if source_match else "DJN"
 
-        articles.append({
+        base = {
             "id": article_id,
             "accession_number": article_id,
             "sequence_number": sequence_number,
@@ -187,23 +231,28 @@ def extract_articles(nml_content):
             "body": body,
             "pub_date": pub_date,
             "source": source,
-            "codes": list(codes & PM_CODES),
             "sentiment": None,
             "ingested_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
 
-    return articles
+        if is_gold:
+            gold_articles.append({**base, "codes": list(codes & PM_CODES)})
+
+        if is_oil:
+            oil_articles.append({**base, "codes": list(codes & OIL_CODES)})
+
+    return gold_articles, oil_articles
 
 
 # ── Sentiment Scoring ─────────────────────────────────────────────────────────
-def score_article(client, headline, body):
+def score_article(client, headline, body, system_prompt):
     content = f"Headline: {headline}\n\nBody: {body or ''}"
     for attempt in range(MAX_RETRIES):
         try:
             message = client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=10,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[{"role": "user", "content": content}]
             )
             score_text = message.content[0].text.strip()
@@ -222,31 +271,34 @@ def score_article(client, headline, body):
     return None
 
 
-def score_and_update(supabase, client, articles):
-    scored = 0
-    for article in articles:
-        score = score_article(client, article["headline"], article.get("body"))
-        if score is not None:
-            try:
-                supabase.table(TABLE).update({"sentiment": score}).eq("id", article["id"]).execute()
-                scored += 1
-                log.info(f"  [{score:3d}] {article['headline'][:80]}")
-            except Exception as e:
-                log.error(f"Sentiment update failed for {article['id']}: {e}")
-        time.sleep(RETRY_DELAY)
-    return scored
-
-
-# ── Supabase Upsert ───────────────────────────────────────────────────────────
-def upsert_articles(supabase, articles):
+def score_and_upsert(supabase, client, articles, table, system_prompt):
+    """Score articles and upsert with sentiment to the correct table."""
     if not articles:
-        return 0
+        return 0, 0
+
+    # First upsert without sentiment
     try:
-        supabase.table(TABLE).upsert(articles, on_conflict="id").execute()
-        return len(articles)
+        supabase.table(table).upsert(articles, on_conflict="id").execute()
     except Exception as e:
-        log.error(f"Upsert failed: {e}")
-        return 0
+        log.error(f"Upsert failed for {table}: {e}")
+        return 0, 0
+
+    upserted = len(articles)
+    scored = 0
+
+    if client:
+        for article in articles:
+            score = score_article(client, article["headline"], article.get("body"), system_prompt)
+            if score is not None:
+                try:
+                    supabase.table(table).update({"sentiment": score}).eq("id", article["id"]).execute()
+                    scored += 1
+                    log.info(f"  [{table[:8]}][{score:3d}] {article['headline'][:70]}")
+                except Exception as e:
+                    log.error(f"Sentiment update failed for {article['id']}: {e}")
+            time.sleep(RETRY_DELAY)
+
+    return upserted, scored
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -260,13 +312,12 @@ def run():
 
     try:
         remote_files = list_remote_files(sftp, SFTP_DIR)
-        processed    = get_processed_filenames(supabase)
+        processed    = get_processed_filenames(supabase, remote_files)
         new_files    = [f for f in remote_files if f not in processed]
 
         log.info(f"Remote files: {len(remote_files)} | Already processed: {len(processed)} | New: {len(new_files)}")
 
-        total_articles = 0
-        total_scored   = 0
+        total_gold = total_oil = total_scored = 0
 
         for filename in new_files:
             remote_path = f"{SFTP_DIR}/{filename}"
@@ -274,27 +325,27 @@ def run():
 
             try:
                 raw = download_file(sftp, remote_path)
-
                 if filename.endswith(".gz"):
                     raw = gzip.decompress(raw)
 
                 nml_content = raw.decode("utf-8", errors="replace")
-                articles = extract_articles(nml_content)
-                n = upsert_articles(supabase, articles)
-                total_articles += n
+                gold_articles, oil_articles = extract_articles(nml_content)
 
-                if n > 0 and claude:
-                    scored = score_and_update(supabase, claude, articles)
-                    total_scored += scored
+                g_upserted, g_scored = score_and_upsert(supabase, claude, gold_articles, "dj_articles", GOLD_PROMPT)
+                o_upserted, o_scored = score_and_upsert(supabase, claude, oil_articles, "dj_oil_articles", OIL_PROMPT)
+
+                total_gold += g_upserted
+                total_oil += o_upserted
+                total_scored += g_scored + o_scored
 
                 mark_file_processed(supabase, filename)
-                log.info(f"  → {n} articles upserted, {total_scored} scored so far")
+                log.info(f"  → gold: {g_upserted} | oil: {o_upserted} | scored: {g_scored + o_scored}")
 
             except Exception as e:
                 log.error(f"Error processing {filename}: {e}")
                 continue
 
-        log.info(f"Done. Articles upserted: {total_articles} | Scored: {total_scored}")
+        log.info(f"Done. Gold: {total_gold} | Oil: {total_oil} | Scored: {total_scored}")
 
     finally:
         sftp.close()
