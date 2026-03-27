@@ -70,7 +70,18 @@ OIL_CODES = {
     "N/NRG",    # Dow Jones Energy Service
 }
 
-ALL_CODES = PM_CODES | OIL_CODES
+EQUITY_CODES = {
+    "N/STK",    # Stock Market News
+    "N/SMC",    # Stock Market Commentary
+    "N/NYS",    # NYSE News
+    "N/USMT",   # US Markets
+}
+
+COPPER_CODES = {
+    "N/CPE",    # Copper & Base Metals
+}
+
+ALL_CODES = PM_CODES | OIL_CODES | EQUITY_CODES | COPPER_CODES
 
 RETRY_DELAY = 1
 MAX_RETRIES = 3
@@ -117,6 +128,46 @@ Consider:
 
 Respond with ONLY a single integer between 0 and 100. No explanation, no text, just the number."""
 
+EQUITY_PROMPT = """You are a financial sentiment analyst specialising in US equity markets.
+
+You will be given a news article headline and body. Score the sentiment of the article from the perspective of a US equity trader on a scale of 0 to 100 where:
+
+0-20   = Very bearish (major sell-off, severe negative macro, systemic risk)
+21-40  = Bearish (negative tone, earnings misses, economic headwinds, risk-off)
+41-59  = Neutral (balanced, mixed signals, no clear directional bias)
+60-79  = Bullish (positive tone, earnings beats, economic strength, risk-on)
+80-100 = Very bullish (strong rally, major positive catalyst, extreme risk-on)
+
+Consider:
+- Index movements (S&P 500, Nasdaq, Dow rising = bullish, falling = bearish)
+- Economic data (strong jobs, GDP = bullish; recession fears, unemployment = bearish)
+- Fed policy (rate cuts, dovish = bullish; rate hikes, hawkish = bearish)
+- Earnings reports (beats = bullish, misses = bearish)
+- Risk sentiment (risk-on = bullish, risk-off = bearish)
+- Geopolitical events and their impact on market confidence
+
+Respond with ONLY a single integer between 0 and 100. No explanation, no text, just the number."""
+
+COPPER_PROMPT = """You are a financial sentiment analyst specialising in copper and base metals markets.
+
+You will be given a news article headline and body. Score the sentiment of the article from the perspective of a copper trader on a scale of 0 to 100 where:
+
+0-20   = Very bearish (major price decline, severe demand destruction, supply glut)
+21-40  = Bearish (negative tone, slowing growth, oversupply, weak demand)
+41-59  = Neutral (balanced, factual, no clear directional bias)
+60-79  = Bullish (positive tone, strong demand, supply constraints, green energy tailwinds)
+80-100 = Very bullish (major supply shock, strong China demand, severe positive catalyst)
+
+Consider:
+- Price movements (rising = bullish, falling = bearish)
+- China demand signals (infrastructure, manufacturing PMI = key driver)
+- Supply disruptions (mine strikes, output cuts = bullish)
+- Green energy transition (EV demand, grid investment = bullish)
+- Global growth indicators (strong PMI, industrial output = bullish)
+- Inventory data (LME stockpile draws = bullish, builds = bearish)
+
+Respond with ONLY a single integer between 0 and 100. No explanation, no text, just the number."""
+
 
 # ── sFTP Connection ───────────────────────────────────────────────────────────
 def get_sftp_client():
@@ -149,7 +200,6 @@ def get_processed_filenames(supabase, remote_files):
         if not remote_files:
             return set()
         processed = set()
-        # Check in batches of 500
         batch_size = 500
         for i in range(0, len(remote_files), batch_size):
             batch = remote_files[i:i + batch_size]
@@ -184,19 +234,23 @@ def clean_text(raw):
 
 
 def extract_articles(nml_content):
-    """Extract articles and classify as gold, oil, or both."""
+    """Extract articles and classify by commodity type."""
     gold_articles = []
     oil_articles = []
+    equity_articles = []
+    copper_articles = []
 
     docs = re.findall(r'<doc\b[^>]*>.*?</doc>', nml_content, re.DOTALL)
 
     for doc in docs:
         codes = set(re.findall(r'<c>([^<]+)</c>', doc))
-        
-        is_gold = bool(codes & PM_CODES)
-        is_oil = bool(codes & OIL_CODES)
-        
-        if not is_gold and not is_oil:
+
+        is_gold   = bool(codes & PM_CODES)
+        is_oil    = bool(codes & OIL_CODES)
+        is_equity = bool(codes & EQUITY_CODES)
+        is_copper = bool(codes & COPPER_CODES)
+
+        if not any([is_gold, is_oil, is_equity, is_copper]):
             continue
 
         hl_match = re.search(r'<headline[^>]*>(.*?)</headline>', doc, re.DOTALL)
@@ -237,11 +291,14 @@ def extract_articles(nml_content):
 
         if is_gold:
             gold_articles.append({**base, "codes": list(codes & PM_CODES)})
-
         if is_oil:
             oil_articles.append({**base, "codes": list(codes & OIL_CODES)})
+        if is_equity:
+            equity_articles.append({**base, "codes": list(codes & EQUITY_CODES)})
+        if is_copper:
+            copper_articles.append({**base, "codes": list(codes & COPPER_CODES)})
 
-    return gold_articles, oil_articles
+    return gold_articles, oil_articles, equity_articles, copper_articles
 
 
 # ── Sentiment Scoring ─────────────────────────────────────────────────────────
@@ -276,7 +333,6 @@ def score_and_upsert(supabase, client, articles, table, system_prompt):
     if not articles:
         return 0, 0
 
-    # First upsert without sentiment
     try:
         supabase.table(table).upsert(articles, on_conflict="id").execute()
     except Exception as e:
@@ -293,7 +349,7 @@ def score_and_upsert(supabase, client, articles, table, system_prompt):
                 try:
                     supabase.table(table).update({"sentiment": score}).eq("id", article["id"]).execute()
                     scored += 1
-                    log.info(f"  [{table[:8]}][{score:3d}] {article['headline'][:70]}")
+                    log.info(f"  [{table[:10]}][{score:3d}] {article['headline'][:70]}")
                 except Exception as e:
                     log.error(f"Sentiment update failed for {article['id']}: {e}")
             time.sleep(RETRY_DELAY)
@@ -317,7 +373,7 @@ def run():
 
         log.info(f"Remote files: {len(remote_files)} | Already processed: {len(processed)} | New: {len(new_files)}")
 
-        total_gold = total_oil = total_scored = 0
+        total_gold = total_oil = total_equity = total_copper = total_scored = 0
 
         for filename in new_files:
             remote_path = f"{SFTP_DIR}/{filename}"
@@ -329,23 +385,27 @@ def run():
                     raw = gzip.decompress(raw)
 
                 nml_content = raw.decode("utf-8", errors="replace")
-                gold_articles, oil_articles = extract_articles(nml_content)
+                gold_articles, oil_articles, equity_articles, copper_articles = extract_articles(nml_content)
 
-                g_upserted, g_scored = score_and_upsert(supabase, claude, gold_articles, "dj_articles", GOLD_PROMPT)
-                o_upserted, o_scored = score_and_upsert(supabase, claude, oil_articles, "dj_oil_articles", OIL_PROMPT)
+                g_upserted, g_scored = score_and_upsert(supabase, claude, gold_articles,   "dj_articles",         GOLD_PROMPT)
+                o_upserted, o_scored = score_and_upsert(supabase, claude, oil_articles,    "dj_oil_articles",     OIL_PROMPT)
+                e_upserted, e_scored = score_and_upsert(supabase, claude, equity_articles, "dj_equity_articles",  EQUITY_PROMPT)
+                c_upserted, c_scored = score_and_upsert(supabase, claude, copper_articles, "dj_copper_articles",  COPPER_PROMPT)
 
-                total_gold += g_upserted
-                total_oil += o_upserted
-                total_scored += g_scored + o_scored
+                total_gold   += g_upserted
+                total_oil    += o_upserted
+                total_equity += e_upserted
+                total_copper += c_upserted
+                total_scored += g_scored + o_scored + e_scored + c_scored
 
                 mark_file_processed(supabase, filename)
-                log.info(f"  → gold: {g_upserted} | oil: {o_upserted} | scored: {g_scored + o_scored}")
+                log.info(f"  → gold: {g_upserted} | oil: {o_upserted} | equity: {e_upserted} | copper: {c_upserted} | scored: {g_scored + o_scored + e_scored + c_scored}")
 
             except Exception as e:
                 log.error(f"Error processing {filename}: {e}")
                 continue
 
-        log.info(f"Done. Gold: {total_gold} | Oil: {total_oil} | Scored: {total_scored}")
+        log.info(f"Done. Gold: {total_gold} | Oil: {total_oil} | Equity: {total_equity} | Copper: {total_copper} | Scored: {total_scored}")
 
     finally:
         sftp.close()
