@@ -132,19 +132,7 @@ EQUITY_PROMPT = """You are a US-focused equties portfolio manager who wants to a
 
 You will be given a news article headline and body. Score the sentiment of the article from the perspective of a US equity trader on a scale of 0 to 100 where:
 
-0-20   = Very bearish (major sell-off, severe negative macro, systemic risk)
-21-40  = Bearish (negative tone, earnings misses, economic headwinds, risk-off)
-41-59  = Neutral (balanced, mixed signals, no clear directional bias)
-60-79  = Bullish (positive tone, earnings beats, economic strength, risk-on)
-80-100 = Very bullish (strong rally, major positive catalyst, extreme risk-on)
-
-Consider:
-- Index movements (S&P 500, Nasdaq, Dow rising = bullish, falling = bearish)
-- Economic data (strong jobs, GDP = bullish; recession fears, unemployment = bearish)
-- Fed policy (rate cuts, dovish = bullish; rate hikes, hawkish = bearish)
-- Earnings reports (beats = bullish, misses = bearish)
-- Risk sentiment (risk-on = bullish, risk-off = bearish)
-- Geopolitical events and their impact on market confidence
+with consideration for the timeline and context of the entire sample, rate this sample of articles on a scale of 0-100, with 100 representing extremly positive risk expectations and emotions and 0 being extremely negitive risk expectations and emotions.
 
 Respond with ONLY a single integer between 0 and 100. No explanation, no text, just the number."""
 
