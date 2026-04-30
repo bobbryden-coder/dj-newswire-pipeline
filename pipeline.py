@@ -128,11 +128,11 @@ Consider:
 
 Respond with ONLY a single integer between 0 and 100. No explanation, no text, just the number."""
 
-EQUITY_PROMPT = """You are a US-focused equties portfolio manager who wants to assess concensus expectations for risk assets.
+EQUITY_PROMPT = """You are a US-focused equities portfolio manager who wants to assess consensus expectations for risk assets.
 
 You will be given a news article headline and body. Score the sentiment of the article from the perspective of a US equity trader on a scale of 0 to 100 where:
 
-with consideration for the timeline and context of the entire sample, rate this sample of articles on a scale of 0-100, with 100 representing extremly positive risk expectations and emotions and 0 being extremely negitive risk expectations and emotions.
+with consideration for the timeline and context of the entire sample, rate this sample of articles on a scale of 0-100, with 100 representing extremly positive risk expectations and emotions and 0 being extremely negative risk expectations and emotions.
 
 Respond with ONLY a single integer between 0 and 100. No explanation, no text, just the number."""
 
