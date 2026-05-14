@@ -81,7 +81,15 @@ COPPER_CODES = {
     "N/CPE",    # Copper & Base Metals
 }
 
-ALL_CODES = PM_CODES | OIL_CODES | EQUITY_CODES | COPPER_CODES
+MACRO_CATEGORIES = {
+    "Central Banks": {"N/CBK","N/CBP","N/CBI","N/ECB","N/PBOC","N/FFR","N/DSR","N/EMP","G/FED","G/TRE","G/UKBK","G/JABJ","G/CNBK","G/SNB","G/GEBK","S/USDW"},
+    "US Economic": {"N/GDP","N/CPI","N/PPI","N/ECI","N/JOB","N/NFP","N/UNP","N/TRD","N/RET","N/ISM","N/PMI","N/HOU","N/CNF","N/IIP","N/BUD","N/PER","N/DGO","N/LEI","N/PCE","N/WGS","N/USL","N/WIN","N/BEI"},
+    "Equities": {"N/STK","N/SMC","N/NYS","N/USMT","N/IPO","N/NDQ","N/MKT","N/DJ","N/SPX","I/BNK","I/INS","I/TEC","I/ENG","I/HLT","I/CNS","I/IND"},
+    "Key Regions": {"R/US","R/EC","R/EZN","R/GE","R/FR","R/UK","R/ITA","R/SP","R/CH","R/JA","R/CN","R/ASI","R/II","R/BR","R/SK"},
+}
+ALL_MACRO_CODES = set().union(*MACRO_CATEGORIES.values())
+
+ALL_CODES = PM_CODES | OIL_CODES | EQUITY_CODES | COPPER_CODES | ALL_MACRO_CODES
 
 RETRY_DELAY = 1
 MAX_RETRIES = 3
@@ -227,6 +235,7 @@ def extract_articles(nml_content):
     oil_articles = []
     equity_articles = []
     copper_articles = []
+    macro_articles = []
 
     docs = re.findall(r'<doc\b[^>]*>.*?</doc>', nml_content, re.DOTALL)
 
@@ -237,8 +246,9 @@ def extract_articles(nml_content):
         is_oil    = bool(codes & OIL_CODES)
         is_equity = bool(codes & EQUITY_CODES)
         is_copper = bool(codes & COPPER_CODES)
+        matched_macro = {cat: cat_codes for cat, cat_codes in MACRO_CATEGORIES.items() if codes & cat_codes}
 
-        if not any([is_gold, is_oil, is_equity, is_copper]):
+        if not any([is_gold, is_oil, is_equity, is_copper]) and not matched_macro:
             continue
 
         hl_match = re.search(r'<headline[^>]*>(.*?)</headline>', doc, re.DOTALL)
@@ -286,7 +296,16 @@ def extract_articles(nml_content):
         if is_copper:
             copper_articles.append({**base, "codes": list(codes & COPPER_CODES)})
 
-    return gold_articles, oil_articles, equity_articles, copper_articles
+        for cat_name, cat_codes in matched_macro.items():
+            slug = cat_name.lower().replace(" ", "_")
+            macro_articles.append({
+                **base,
+                "id": f"{article_id}_{slug}",
+                "codes": list(codes & cat_codes),
+                "category": cat_name,
+            })
+
+    return gold_articles, oil_articles, equity_articles, copper_articles, macro_articles
 
 
 # ── Sentiment Scoring ─────────────────────────────────────────────────────────
@@ -361,7 +380,7 @@ def run():
 
         log.info(f"Remote files: {len(remote_files)} | Already processed: {len(processed)} | New: {len(new_files)}")
 
-        total_gold = total_oil = total_equity = total_copper = total_scored = 0
+        total_gold = total_oil = total_equity = total_copper = total_macro = total_scored = 0
 
         for filename in new_files:
             remote_path = f"{SFTP_DIR}/{filename}"
@@ -373,27 +392,39 @@ def run():
                     raw = gzip.decompress(raw)
 
                 nml_content = raw.decode("utf-8", errors="replace")
-                gold_articles, oil_articles, equity_articles, copper_articles = extract_articles(nml_content)
+                gold_articles, oil_articles, equity_articles, copper_articles, macro_articles = extract_articles(nml_content)
 
                 g_upserted, g_scored = score_and_upsert(supabase, claude, gold_articles,   "dj_articles",         GOLD_PROMPT)
                 o_upserted, o_scored = score_and_upsert(supabase, claude, oil_articles,    "dj_oil_articles",     OIL_PROMPT)
                 e_upserted, e_scored = score_and_upsert(supabase, claude, equity_articles, "dj_equity_articles",  EQUITY_PROMPT)
                 c_upserted, c_scored = score_and_upsert(supabase, claude, copper_articles, "dj_copper_articles",  COPPER_PROMPT)
 
+                # Macro articles: upsert only, no per-article scoring
+                m_upserted = 0
+                if macro_articles:
+                    try:
+                        for i in range(0, len(macro_articles), 500):
+                            batch = macro_articles[i:i + 500]
+                            supabase.table("dj_macro_articles").upsert(batch, on_conflict="id").execute()
+                        m_upserted = len(macro_articles)
+                    except Exception as e:
+                        log.error(f"Upsert failed for dj_macro_articles: {e}")
+
                 total_gold   += g_upserted
                 total_oil    += o_upserted
                 total_equity += e_upserted
                 total_copper += c_upserted
+                total_macro  += m_upserted
                 total_scored += g_scored + o_scored + e_scored + c_scored
 
                 mark_file_processed(supabase, filename)
-                log.info(f"  → gold: {g_upserted} | oil: {o_upserted} | equity: {e_upserted} | copper: {c_upserted} | scored: {g_scored + o_scored + e_scored + c_scored}")
+                log.info(f"  → gold: {g_upserted} | oil: {o_upserted} | equity: {e_upserted} | copper: {c_upserted} | macro: {m_upserted} | scored: {g_scored + o_scored + e_scored + c_scored}")
 
             except Exception as e:
                 log.error(f"Error processing {filename}: {e}")
                 continue
 
-        log.info(f"Done. Gold: {total_gold} | Oil: {total_oil} | Equity: {total_equity} | Copper: {total_copper} | Scored: {total_scored}")
+        log.info(f"Done. Gold: {total_gold} | Oil: {total_oil} | Equity: {total_equity} | Copper: {total_copper} | Macro: {total_macro} | Scored: {total_scored}")
 
     finally:
         sftp.close()
